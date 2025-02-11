@@ -18,11 +18,7 @@ static ZNode *znode_new(const char *name, size_t len, double score) {
     return node;
 }
 
-static void znode_del(ZNode *node) {
-    free(node);
-}
-
-static size_t min(size_t lhs, size_t rhs) {
+static uint32_t min(size_t lhs, size_t rhs) {
     return lhs < rhs ? lhs : rhs;
 }
 
@@ -47,33 +43,31 @@ static bool zless(AVLNode *lhs, AVLNode *rhs) {
 }
 
 // insert into the AVL tree
-static void tree_insert(ZSet *zset, ZNode *node) {
-    AVLNode *parent = NULL;         // insert under this node
-    AVLNode **from = &zset->root;   // the incoming pointer to the next node
+static void tree_add(ZSet *zset, ZNode *node) {
+    AVLNode *cur = NULL;            // current node
+    AVLNode **from = &zset->tree;   // the incoming pointer to the next node
     while (*from) {                 // tree search
-        parent = *from;
-        from = zless(&node->tree, parent) ? &parent->left : &parent->right;
+        cur = *from;
+        from = zless(&node->tree, cur) ? &cur->left : &cur->right;
     }
     *from = &node->tree;            // attach the new node
-    node->tree.parent = parent;
-    zset->root = avl_fix(&node->tree);
+    node->tree.parent = cur;
+    zset->tree = avl_fix(&node->tree);
 }
 
-// update the score of an existing node
+// update the score of an existing node (AVL tree reinsertion)
 static void zset_update(ZSet *zset, ZNode *node, double score) {
     if (node->score == score) {
         return;
     }
-    // detach the tree node
-    zset->root = avl_del(&node->tree);
-    avl_init(&node->tree);
-    // reinsert the tree node
+    zset->tree = avl_del(&node->tree);
     node->score = score;
-    tree_insert(zset, node);
+    avl_init(&node->tree);
+    tree_add(zset, node);
 }
 
 // add a new (score, name) tuple, or update the score of the existing tuple
-bool zset_insert(ZSet *zset, const char *name, size_t len, double score) {
+bool zset_add(ZSet *zset, const char *name, size_t len, double score) {
     ZNode *node = zset_lookup(zset, name, len);
     if (node) {
         zset_update(zset, node, score);
@@ -81,7 +75,7 @@ bool zset_insert(ZSet *zset, const char *name, size_t len, double score) {
     } else {
         node = znode_new(name, len, score);
         hm_insert(&zset->hmap, &node->hmap);
-        tree_insert(zset, node);
+        tree_add(zset, node);
         return true;
     }
 }
@@ -104,7 +98,7 @@ static bool hcmp(HNode *node, HNode *key) {
 
 // lookup by name
 ZNode *zset_lookup(ZSet *zset, const char *name, size_t len) {
-    if (!zset->root) {
+    if (!zset->tree) {
         return NULL;
     }
 
@@ -116,30 +110,36 @@ ZNode *zset_lookup(ZSet *zset, const char *name, size_t len) {
     return found ? container_of(found, ZNode, hmap) : NULL;
 }
 
-// delete a node
-void zset_delete(ZSet *zset, ZNode *node) {
-    // remove from the hashtable
+// deletion by name
+ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
+    if (!zset->tree) {
+        return NULL;
+    }
+
     HKey key;
-    key.node.hcode = node->hmap.hcode;
-    key.name = node->name;
-    key.len = node->len;
-    HNode *found = hm_delete(&zset->hmap, &key.node, &hcmp);
-    assert(found);
-    // remove from the tree
-    zset->root = avl_del(&node->tree);
-    // deallocate the node
-    znode_del(node);
+    key.node.hcode = str_hash((uint8_t *)name, len);
+    key.name = name;
+    key.len = len;
+    HNode *found = hm_pop(&zset->hmap, &key.node, &hcmp);
+    if (!found) {
+        return NULL;
+    }
+
+    ZNode *node = container_of(found, ZNode, hmap);
+    zset->tree = avl_del(&node->tree);
+    return node;
 }
 
-// find the first (score, name) tuple that is >= key.
-ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len) {
+// find the (score, name) tuple that is greater or equal to the argument.
+ZNode *zset_query(ZSet *zset, double score, const char *name, size_t len) {
     AVLNode *found = NULL;
-    for (AVLNode *node = zset->root; node; ) {
-        if (zless(node, score, name, len)) {
-            node = node->right; // node < key
+    AVLNode *cur = zset->tree;
+    while (cur) {
+        if (zless(cur, score, name, len)) {
+            cur = cur->right;
         } else {
-            found = node;       // candidate
-            node = node->left;
+            found = cur;    // candidate
+            cur = cur->left;
         }
     }
     return found ? container_of(found, ZNode, tree) : NULL;
@@ -149,6 +149,10 @@ ZNode *zset_seekge(ZSet *zset, double score, const char *name, size_t len) {
 ZNode *znode_offset(ZNode *node, int64_t offset) {
     AVLNode *tnode = node ? avl_offset(&node->tree, offset) : NULL;
     return tnode ? container_of(tnode, ZNode, tree) : NULL;
+}
+
+void znode_del(ZNode *node) {
+    free(node);
 }
 
 static void tree_dispose(AVLNode *node) {
@@ -161,8 +165,7 @@ static void tree_dispose(AVLNode *node) {
 }
 
 // destroy the zset
-void zset_clear(ZSet *zset) {
-    hm_clear(&zset->hmap);
-    tree_dispose(zset->root);
-    zset->root = NULL;
+void zset_dispose(ZSet *zset) {
+    tree_dispose(zset->tree);
+    hm_destroy(&zset->hmap);
 }
